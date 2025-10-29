@@ -13,8 +13,10 @@ Automatically download music videos and sync them with Clone Hero songs. I used 
 - Works with Windows file paths and standard Clone Hero song folder structures.
 
 ---
+
 ## Issues
-It can't automatically sync it if they have a longer intro. You can sync it manually by uploading the song and audio file to mircosoft clipchamp. Detect the audio from the video. Then match the audio waves up. Once you do that well enough you can see the offset by hovering over where the video audio starts. Then go to song.ini and change video_start_time = \(\pm \) ____ with that timestamp in ms.
+It can't automatically sync it if they have a longer intro. You can sync it manually by uploading the song and audio file to mircosoft clipchamp. Detect the audio from the video. Then match the audio waves up. Once you do that well enough you can see the offset by hovering over where the video audio starts. Then go to song.ini and change video_start_time = ____ with that timestamp in ms.
+
 ---
 
 ## Requirements
