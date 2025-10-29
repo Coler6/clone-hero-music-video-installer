@@ -1,6 +1,6 @@
 # Clone Hero Video Sync Tool
 
-Automatically download music videos and sync them with Clone Hero songs. I used a fuck ton of chatgpt to make this but it works. Some music videos don't work since they used cropped versions of the song like Smells Like Teen Spirit. You can use onyx to convert .sng files into folders. Idk if it works for everything but it worked for every song I used.
+Automatically download music videos and sync them with Clone Hero songs. I used a fuck ton of chatgpt to make this but it works. Some music videos don't work since they used cropped versions of the song like Smells Like Teen Spirit.  You can use onyx to convert .sng files into folders.  Idk if it works for everything but it worked for every song I used.
 
 ---
 
@@ -12,6 +12,9 @@ Automatically download music videos and sync them with Clone Hero songs. I used 
 - Writes `video_start_time` (in **milliseconds**) directly to `song.ini`.  
 - Works with Windows file paths and standard Clone Hero song folder structures.
 
+---
+## Issues
+It can't automatically sync it if they have a longer intro. You can sync it manually by uploading the song and audio file to mircosoft clipchamp. Detect the audio from the video. Then match the audio waves up. Once you do that well enough you can see the offset by hovering over where the video audio starts. Then go to song.ini and change video_start_time = \pm____ with that timestamp in ms.
 ---
 
 ## Requirements
