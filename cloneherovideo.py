@@ -1,104 +1,162 @@
+"""
+Clone Hero Music Video Sync Tool
+--------------------------------
+Downloads and syncs YouTube music videos to Clone Hero song folders
+by detecting the offset between the video audio and the song stems.
+"""
+
 import os
-import sys
 import subprocess
+import tempfile
+import argparse
 import configparser
+
 import yt_dlp
 import numpy as np
 import librosa
-import soundfile as sf
-import tempfile
+from scipy.spatial.distance import cdist
+from scipy.signal import medfilt, correlate
 
-from scipy.io import wavfile
 
-def detect_audio_offset(combined_audio_path, video_path, duration=10.0):
-    import tempfile, subprocess, os, numpy as np, soundfile as sf
+def detect_audio_offset(combined_audio_path, video_path, duration=30.0, debug=True):
+    """Offset detection between combined audio stems and video audio."""
+    sr = 22050
+    hop_length = 512
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
-        extracted_audio = tmp_audio.name
+    try:
+        # --- 1) Load audio (limit song to duration; load more of video)
+        song_audio, _ = librosa.load(combined_audio_path, sr=sr, mono=True, duration=duration)
+        video_audio, _ = librosa.load(video_path, sr=sr, mono=True, duration=max(duration * 2, duration + 20))
 
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-ac", "1", "-ar", "22050",
-        "-t", str(duration),
-        "-f", "wav", "-acodec", "pcm_s16le", extracted_audio
-    ]
-    res = subprocess.run([
-        "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-ac", "1", "-ar", "22050",
-        "-t", str(duration),
-        "-f", "wav", "-acodec", "pcm_s16le", extracted_audio
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if len(song_audio) < 2048 or len(video_audio) < 2048:
+            if debug:
+                print("Audio too short for robust detection; returning 0")
+            return 0.0
 
-    if res.returncode != 0:
-        print("FFmpeg failed:\n", res.stderr.decode())
-        return 0.0
+        #2 Compute onset strength envelopes
+        song_onset_env = librosa.onset.onset_strength(y=song_audio, sr=sr, hop_length=hop_length)
+        video_onset_env = librosa.onset.onset_strength(y=video_audio, sr=sr, hop_length=hop_length)
 
-    # Load audio safely
-    song_audio, sr1 = sf.read(combined_audio_path)
-    video_audio, sr2 = sf.read(extracted_audio)
+        #3 Denoise onset envelopes with median filter
+        k = int(max(1, round(sr / hop_length / 2)))
+        if k % 2 == 0:
+            k += 1
+        song_env_d = song_onset_env - medfilt(song_onset_env, kernel_size=k)
+        video_env_d = video_onset_env - medfilt(video_onset_env, kernel_size=k)
 
-    # Normalize
-    song_audio /= np.max(np.abs(song_audio)) + 1e-9
-    video_audio /= np.max(np.abs(video_audio)) + 1e-9
+        # Rectify and normalize
+        song_env_d = np.clip(song_env_d, 0, None)
+        video_env_d = np.clip(video_env_d, 0, None)
+        song_env_d /= np.max(song_env_d) + 1e-9
+        video_env_d /= np.max(video_env_d) + 1e-9
 
-    # Cross-correlation
-    correlation = np.correlate(video_audio, song_audio, mode="full")
-    lag = np.argmax(correlation) - len(song_audio)
-    offset_seconds = lag / sr1
+        if np.max(song_env_d) < 1e-4 or np.max(video_env_d) < 1e-4:
+            if debug:
+                print("Onset envelopes too small -> fallback to chroma DTW")
+            return _detect_offset_dtw(song_audio=song_audio, video_audio=video_audio,
+                                      sr=sr, hop_length=hop_length, duration=duration, debug=debug)
 
-    os.remove(extracted_audio)
+        #4 FFT-based correlation
+        corr = correlate(video_env_d, song_env_d, mode='full', method='fft')
+        best_idx = np.argmax(corr)
+        lag_frames = best_idx - (len(song_env_d) - 1)
+        offset_seconds = lag_frames * hop_length / sr
+        peak_value = corr[best_idx]
+
+        if debug:
+            print(f"Onset-corr candidate offset = {offset_seconds:.3f}s, peak={float(peak_value):.5f}")
+
+        #5 Heuristic check
+        flat_sorted = np.sort(corr)
+        median_side = np.median(flat_sorted[:max(1, int(len(flat_sorted) * 0.5))])
+        if peak_value < max(0.05, 5.0 * (median_side + 1e-12)):
+            if debug:
+                print("Correlation peak too weak -> using DTW chroma fallback")
+            return _detect_offset_dtw(song_audio_path=combined_audio_path, video_audio_path=video_path,
+                                      duration=duration, debug=debug)
+
+        return offset_seconds
+
+    except Exception as e:
+        if debug:
+            import traceback
+            traceback.print_exc()
+        return _detect_offset_dtw(song_audio_path=combined_audio_path, video_audio_path=video_path,
+                                  duration=duration, debug=debug)
+
+
+def _detect_offset_dtw(song_audio_path=None, video_audio_path=None, song_audio=None, video_audio=None,
+                       sr=22050, hop_length=512, duration=30.0, debug=False):
+    """
+    Internal DTW chroma fallback.
+    Returns offset_seconds where video starts relative to song.
+    """
+    if song_audio is None or video_audio is None:
+        song_audio, _ = librosa.load(song_audio_path, sr=sr, mono=True, duration=duration)
+        video_audio, _ = librosa.load(video_audio_path, sr=sr, mono=True, duration=max(duration * 3, duration + 30))
+
+    try:
+        song_chroma = librosa.feature.chroma_cqt(y=song_audio, sr=sr)
+        video_chroma = librosa.feature.chroma_cqt(y=video_audio, sr=sr)
+    except Exception:
+        song_chroma = librosa.feature.chroma_stft(y=song_audio, sr=sr)
+        video_chroma = librosa.feature.chroma_stft(y=video_audio, sr=sr)
+
+    sc = song_chroma / (np.linalg.norm(song_chroma, axis=0, keepdims=True) + 1e-9)
+    vc = video_chroma / (np.linalg.norm(video_chroma, axis=0, keepdims=True) + 1e-9)
+    cost = cdist(sc.T, vc.T, metric='cosine')
+
+    try:
+        D, wp = librosa.sequence.dtw(C=cost, backtrack=True)
+    except Exception:
+        song_vec = np.mean(sc, axis=0)
+        video_vec = np.mean(vc, axis=0)
+        corr = correlate(video_vec, song_vec, mode='full', method='fft')
+        lag = np.argmax(corr) - (len(song_vec) - 1)
+        offset_seconds = lag * hop_length / sr
+        if debug:
+            print(f"DTW failed; used mean-chroma corr -> offset {offset_seconds:.3f}s")
+        return offset_seconds
+
+    wp = np.array(wp)
+    if wp.shape[1] == 2:
+        wp = wp.T
+    song_idx, vid_idx = wp[:, 0], wp[:, 1]
+    candidates = vid_idx[song_idx <= 2]
+    candidate_vid_idx = int(np.median(candidates)) if len(candidates) else int(vid_idx[np.argmin(song_idx)])
+    offset_seconds = librosa.frames_to_time(candidate_vid_idx, sr=sr, hop_length=hop_length)
+
+    if debug:
+        print(f"DTW mapping offset: {offset_seconds:.3f}s")
     return offset_seconds
 
-
 def combine_audio_stems_pcm(song_folder, duration=10.0):
-    """
-    Combine all audio stems into a single PCM WAV file compatible with scipy.io.wavfile.
-    Only uses the first `duration` seconds.
-    """
-    audio_files = [
-        os.path.join(song_folder, f)
-        for f in os.listdir(song_folder)
-        if f.lower().endswith(('.opus', '.ogg', '.mp3', '.wav'))
-    ]
+    """Combine all audio stems into a single PCM WAV file."""
+    audio_files = [os.path.join(song_folder, f) for f in os.listdir(song_folder)
+                   if f.lower().endswith(('.opus', '.ogg', '.mp3', '.wav'))]
     if not audio_files:
         print("No audio files found.")
         return None
 
-    # Convert stems individually to temp PCM WAV files
     temp_wavs = []
     for f in audio_files:
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
         subprocess.run([
             "ffmpeg", "-y", "-i", f,
-            "-t", str(duration),
-            "-ac", "1",
-            "-ar", "22050",
-            "-f", "wav",
-            "-acodec", "pcm_s16le",
-            tmp
+            "-t", str(duration), "-ac", "1", "-ar", "22050",
+            "-f", "wav", "-acodec", "pcm_s16le", tmp
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         temp_wavs.append(tmp)
 
-    # Combine all temp WAVs with ffmpeg
     mixed_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    inputs = []
-    for w in temp_wavs:
-        inputs += ["-i", w]
-
+    inputs = sum((["-i", w] for w in temp_wavs), [])
     filter_complex = f"amix=inputs={len(temp_wavs)}:normalize=0:duration=longest"
 
     subprocess.run([
-        "ffmpeg",
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-ar", "22050",
-        "-ac", "1",
-        "-f", "wav",
-        "-acodec", "pcm_s16le",
-        "-y", mixed_path
+        "ffmpeg", *inputs, "-filter_complex", filter_complex,
+        "-ar", "22050", "-ac", "1", "-f", "wav", "-acodec", "pcm_s16le", "-y", mixed_path
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Clean up temp WAVs
     for w in temp_wavs:
         try: os.remove(w)
         except: pass
@@ -107,9 +165,8 @@ def combine_audio_stems_pcm(song_folder, duration=10.0):
 
 
 def download_video(query, output_path):
-    """Download a YouTube video as MP4 (H.264 or H.265), no metadata."""
+    """Download a YouTube music video as MP4."""
     ydl_opts = {
-        # Prefer h264 or h265 (avoid av1/vp9), fallback to mp4 if not available
         'format': (
             'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/'
             'bestvideo[vcodec^=hev1][ext=mp4]+bestaudio[ext=m4a]/'
@@ -120,14 +177,8 @@ def download_video(query, output_path):
         'quiet': False,
         'outtmpl': os.path.join(output_path, 'video.%(ext)s'),
         'postprocessors': [
-            {
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            },
-            {
-                'key': 'FFmpegMetadata',
-                'add_metadata': False,
-            },
+            {'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'},
+            {'key': 'FFmpegMetadata', 'add_metadata': False},
         ],
     }
 
@@ -135,67 +186,11 @@ def download_video(query, output_path):
         ydl.download([f"ytsearch1:{query} music video"])
 
 
-def clear_metadata(file_path):
-    """Remove all metadata from a video using ffmpeg."""
-    temp_output = file_path.replace('.mp4', '_clean.mp4')
-    subprocess.run([
-        'ffmpeg', '-i', file_path,
-        '-map', '0', '-map_metadata', '-1', '-c', 'copy', temp_output,
-        '-y'
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    os.replace(temp_output, file_path)
-
-def sync_video(video_path, offset_seconds):
-    """Shift video timing to match offset."""
-    output_path = video_path.replace('.mp4', '_synced.mp4')
-    if offset_seconds >= 0:
-        # Delay video relative to audio
-        subprocess.run([
-            'ffmpeg', '-i', video_path,
-            '-itsoffset', str(offset_seconds),
-            '-i', video_path, '-map', '1:v', '-map', '0:a?',
-            '-c', 'copy', output_path, '-y'
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        # Trim the start of the video
-        subprocess.run([
-            'ffmpeg', '-ss', str(abs(offset_seconds)),
-            '-i', video_path, '-c', 'copy', output_path, '-y'
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    os.replace(output_path, video_path)
-
-def read_song_ini(ini_path):
-    """Read song.ini and extract song title and video offset."""
-    config = configparser.ConfigParser()
-
-    # Safely read the file with fallback for encoding
-    try:
-        with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
-            config.read_file(f)
-    except Exception as e:
-        print(f"Error reading song.ini: {e}")
-        return None, 0.0
-
-    title = None
-    offset = 0.0
-
-    if 'song' in config:
-        title = config['song'].get('name', None)
-        offset = float(config['song'].get('video_offset', 0) or 0)
-    else:
-        # Sometimes song.ini has no [song] section
-        for section in config.sections():
-            if 'name' in config[section]:
-                title = config[section]['name']
-            if 'video_offset' in config[section]:
-                offset = float(config[section].get('video_offset', 0) or 0)
-    return title, offset
-
 def update_song_ini(ini_path, offset_seconds):
-    """Add or update video_start_time in song.ini (stored in milliseconds)."""
-    offset_ms = int(round(offset_seconds * 1000))  # convert to ms
-
+    """Add or update video_start_time in song.ini."""
+    offset_ms = int(round(offset_seconds * 1000))
     config = configparser.ConfigParser()
+
     with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
         config.read_file(f)
 
@@ -209,13 +204,17 @@ def update_song_ini(ini_path, offset_seconds):
 
     print(f"Saved video_start_time = {offset_ms} (milliseconds) to song.ini")
 
-def main(song_folder):
+def main(song_folder, duration=10.0):
     ini_path = os.path.join(song_folder, 'song.ini')
     if not os.path.exists(ini_path):
         print("No song.ini found.")
         return
 
-    title, offset = read_song_ini(ini_path)
+    config = configparser.ConfigParser()
+    with open(ini_path, 'r', encoding='utf-8', errors='ignore') as f:
+        config.read_file(f)
+
+    title = config['song'].get('name', None)
     if not title:
         print("Could not read song title from song.ini.")
         return
@@ -223,21 +222,21 @@ def main(song_folder):
     print(f"Downloading video for: {title}")
     download_video(title, song_folder)
 
-    video_path = next((os.path.join(song_folder, f) for f in os.listdir(song_folder) if f.startswith('video.') and f.endswith('.mp4')), None)
+    video_path = next((os.path.join(song_folder, f)
+                      for f in os.listdir(song_folder)
+                      if f.startswith('video.') and f.endswith('.mp4')), None)
     if not video_path:
         print("Video download failed.")
         return
 
     print("Combining all audio stems into one track...")
-    combined_audio = combine_audio_stems_pcm(song_folder, duration=10.0)
+    combined_audio = combine_audio_stems_pcm(song_folder, duration=duration)
     if not combined_audio:
         print("No audio files to combine. Exiting.")
         return
-    print("Combined audio file:", combined_audio)
-    subprocess.run(["ffmpeg", "-i", combined_audio])
-    print("File size (bytes):", os.path.getsize(combined_audio))
+
     print("Detecting offset between combined audio and video...")
-    detected_offset = detect_audio_offset(combined_audio, video_path, duration=10.0)
+    detected_offset = detect_audio_offset(combined_audio, video_path, duration=duration)
     print(f"Detected offset: {detected_offset:.3f} seconds")
 
     try:
@@ -246,12 +245,13 @@ def main(song_folder):
         pass
 
     update_song_ini(ini_path, detected_offset)
-
     print("Done! Added offset to song.ini")
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: python sync_video.py <song_folder_path>")
-    else:
-        main(sys.argv[1])
+    parser = argparse.ArgumentParser(description="Clone Hero Music Video Sync Tool")
+    parser.add_argument("song_folder", help="Path to the Clone Hero song folder")
+    parser.add_argument("--duration", type=float, default=10.0,
+                        help="Duration (in seconds) of audio used for offset detection (default: 10)")
+    args = parser.parse_args()
+    main(args.song_folder, args.duration)
