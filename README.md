@@ -31,9 +31,9 @@ pip install numpy soundfile librosa yt-dlp
 
 ---
 
-
+## Example
 ```bash
-python cloneherovideo.py "D:\songs\My Chemical Romance - Teenagers (Harmonix) --duration"
+python cloneherovideo.py "D:\songs\My Chemical Romance - Teenagers (Harmonix) --duration 5.0"
 ```
 
 What the script does:
