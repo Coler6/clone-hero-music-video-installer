@@ -1,6 +1,6 @@
 # Clone Hero Video Sync Tool
 
-Automatically download music videos and sync them with Clone Hero songs. This tool combines all audio stems from a song folder, detects the video/audio offset, and updates `song.ini` with the correct `video_start_time`.
+Automatically download music videos and sync them with Clone Hero songs. I used a fuck ton of chatgpt to make this but it works. Some music videos don't work since they used cropped versions of the song like Smells Like Teen Spirit. You can use onyx to convert .sng files into folders. Idk if it works for everything but it worked for every song I used.
 
 ---
 
@@ -17,7 +17,7 @@ Automatically download music videos and sync them with Clone Hero songs. This to
 ## Requirements
 
 - Python 3.10+  
-- [FFmpeg](https://ffmpeg.org/) installed and in your system PATH  
+- [FFmpeg](https://ffmpeg.org/) installed and in your system PATH or the same folder as cloneherovideo.py
 - Python packages:
 
 ```bash
@@ -38,5 +38,3 @@ What the script does:
 4. Cross-correlates the two clips to detect offset.
 5. Warning this takes a long time at "Detecting offset between combined audio and video..." give it like 5 minutes.
 6. Writes `video_start_time = <ms>` to `song.ini` (milliseconds).
-
-I used a fuck ton of chatgpt to make this but it works. Some music videos don't work since they used cropped versions of the song like Smells Like Teen Spirit.
